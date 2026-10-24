@@ -640,7 +640,8 @@ class EchoCloudVideo(EchoVideo):
         # line, so the optional cue identifier before it (e.g. "cue-1") and
         # header/NOTE/STYLE blocks are dropped.
         lines = []
-        for block in re.split(r"\n\s*\n", vtt.replace("\r\n", "\n")):
+        vtt = vtt.replace("\r\n", "\n").replace("\r", "\n")
+        for block in re.split(r"\n\s*\n", vtt):
             block_lines = [line.strip() for line in block.split("\n")]
             timing = [i for i, line in enumerate(block_lines) if "-->" in line]
             if not timing:
@@ -672,6 +673,7 @@ class EchoCloudVideo(EchoVideo):
                 cookie["value"],
                 domain=cookie.get("domain", ""),
                 path=cookie.get("path", "/"),
+                secure=cookie.get("secure", False),
             )
         session.headers["User-Agent"] = self._driver.execute_script(
             "return navigator.userAgent"
@@ -706,22 +708,33 @@ class EchoCloudVideo(EchoVideo):
                 if lines:
                     break
 
-        vtt = None
-        for caption_url in captions:
-            try:
-                r = session.get(caption_url, timeout=timeout)
-            except requests.exceptions.RequestException as e:
-                _LOGGER.debug("GET %s failed: %s", caption_url, e)
-                continue
-            _LOGGER.debug("GET %s -> %s", caption_url, r.status_code)
-            if r.ok and r.text.lstrip().startswith("WEBVTT"):
-                vtt = r.text
-                break
-        if vtt is not None:
-            with open(vtt_path, "w", encoding="utf-8") as f:
-                f.write(vtt)
-            if not lines:
-                lines = self._vtt_to_lines(vtt)
+        if os.path.exists(vtt_path):
+            # captions were saved by an earlier run; reuse them
+            with open(vtt_path, encoding="utf-8-sig", errors="replace") as f:
+                vtt = f.read()
+        else:
+            vtt = None
+            for caption_url in captions:
+                try:
+                    r = session.get(caption_url, timeout=timeout)
+                except requests.exceptions.RequestException as e:
+                    _LOGGER.debug("GET %s failed: %s", caption_url, e)
+                    continue
+                _LOGGER.debug("GET %s -> %s", caption_url, r.status_code)
+                if not r.ok:
+                    continue
+                # WebVTT is always UTF-8; decode it as such (dropping any BOM)
+                # rather than trusting requests' guess, which falls back to
+                # ISO-8859-1 when the server sends no charset.
+                text = r.content.decode("utf-8-sig", errors="replace")
+                if text.lstrip().startswith("WEBVTT"):
+                    vtt = text
+                    break
+            if vtt is not None:
+                with open(vtt_path, "w", encoding="utf-8") as f:
+                    f.write(vtt)
+        if vtt is not None and not lines:
+            lines = self._vtt_to_lines(vtt)
 
         if txt_exists:
             print(" > Skipping downloaded transcript")
