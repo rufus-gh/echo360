@@ -372,7 +372,12 @@ def main():
         course_uuid = re.search(
             "[^/]([0-9a-zA-Z]+[-])+[0-9a-zA-Z]+", course_url
         ).group()  # retrieve the last part of the URL
-        course = EchoCloudCourse(course_uuid, course_hostname, alternative_feeds)
+        course = EchoCloudCourse(
+            course_uuid,
+            course_hostname,
+            alternative_feeds,
+            skip_video_discovery=transcripts_only,
+        )
     else:
         # import it here for monkey patching gevent, to fix the followings:
         # MonkeyPatchWarning: Monkey-patching ssl after ssl has already been

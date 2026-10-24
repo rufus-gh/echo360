@@ -194,7 +194,13 @@ class EchoVideo(object):
 
 class EchoCloudVideos(EchoVideos):
     def __init__(
-        self, videos_json, driver, hostname, alternative_feeds, skip_video_on_error=True
+        self,
+        videos_json,
+        driver,
+        hostname,
+        alternative_feeds,
+        skip_video_on_error=True,
+        skip_video_discovery=False,
     ):
         assert videos_json is not None
         self._driver = driver
@@ -206,7 +212,11 @@ class EchoCloudVideos(EchoVideos):
             try:
                 self._videos.append(
                     EchoCloudVideo(
-                        video_json, self._driver, hostname, alternative_feeds
+                        video_json,
+                        self._driver,
+                        hostname,
+                        alternative_feeds,
+                        skip_video_discovery=skip_video_discovery,
                     )
                 )
             except Exception:
@@ -226,7 +236,9 @@ class EchoCloudVideo(EchoVideo):
     def video_url(self):
         return "{}/lesson/{}/classroom".format(self.hostname, self.video_id)
 
-    def __init__(self, video_json, driver, hostname, alternative_feeds):
+    def __init__(
+        self, video_json, driver, hostname, alternative_feeds, skip_video_discovery=False
+    ):
         self.hostname = hostname
         self._driver = driver
         self.video_json = video_json
@@ -242,6 +254,7 @@ class EchoCloudVideo(EchoVideo):
                     hostname,
                     group_name=video_json["groupInfo"]["name"],
                     alternative_feeds=alternative_feeds,
+                    skip_video_discovery=skip_video_discovery,
                 )
                 for sub_video_json in video_json["lessons"]
             ]
@@ -254,14 +267,21 @@ class EchoCloudVideo(EchoVideo):
         video_id = "{0}".format(video_json["lesson"]["lesson"]["id"])
         self.video_id = str(video_id)  # cast back to string
 
-        self._driver.get(self.video_url)
-        _LOGGER.debug(
-            "Dumping video page at %s: %s", self.video_url, self._driver.page_source
-        )
+        if skip_video_discovery:
+            # only transcripts are wanted, which download_transcript() finds on
+            # its own, so don't let video lookup slow down or drop this lesson.
+            self._url = None
+        else:
+            self._driver.get(self.video_url)
+            _LOGGER.debug(
+                "Dumping video page at %s: %s",
+                self.video_url,
+                self._driver.page_source,
+            )
 
-        m3u8_url = self._loop_find_m3u8_url(self.video_url, waitsecond=30)
-        _LOGGER.debug("Found the following urls %s", m3u8_url)
-        self._url = m3u8_url
+            m3u8_url = self._loop_find_m3u8_url(self.video_url, waitsecond=30)
+            _LOGGER.debug("Found the following urls %s", m3u8_url)
+            self._url = m3u8_url
 
         self._date = self.get_date(video_json)
         self._title = video_json["lesson"]["lesson"]["name"]
@@ -557,20 +577,27 @@ class EchoCloudVideo(EchoVideo):
     _MEDIA_ID_RE = re.compile(r'\\?"mediaId\\?"\s*:\s*\\?"([0-9a-fA-F-]{36})')
     _CAPTIONS_VTT_RE = re.compile(r'https://captions\.[^"\'\s\\]+?\.vtt')
 
-    def _find_media_ids_and_captions(self, waitsecond=30):
+    def _find_media_ids_and_captions(self, waitsecond=30, captions_grace=5):
         # the classroom page embeds the player config (with the media id and
         # the captions .vtt url) as escaped JSON, which can take a moment to
-        # appear after navigation.
+        # appear after navigation. Wait for both; once the media id is there,
+        # only wait a few more seconds for captions since some lectures have
+        # none.
         import time
 
         self._driver.get(self.video_url)
         media_ids, captions = [], []
+        seconds_since_media_id = 0
         for _ in range(waitsecond):
             page = self._driver.page_source.replace("\\/", "/")
             media_ids = list(dict.fromkeys(self._MEDIA_ID_RE.findall(page)))
             captions = list(dict.fromkeys(self._CAPTIONS_VTT_RE.findall(page)))
-            if media_ids:
+            if media_ids and captions:
                 break
+            if media_ids:
+                if seconds_since_media_id >= captions_grace:
+                    break
+                seconds_since_media_id += 1
             time.sleep(1)
         _LOGGER.debug("Media ids: %s, captions: %s", media_ids, captions)
         return media_ids, captions
@@ -608,21 +635,21 @@ class EchoCloudVideo(EchoVideo):
 
     @staticmethod
     def _vtt_to_lines(vtt):
+        # A VTT file is blank-line separated blocks. Only blocks with a timing
+        # line ("... --> ...") are cues; the text is whatever follows the timing
+        # line, so the optional cue identifier before it (e.g. "cue-1") and
+        # header/NOTE/STYLE blocks are dropped.
         lines = []
-        for line in vtt.splitlines():
-            line = line.strip()
-            if (
-                not line
-                or line == "WEBVTT"
-                or "-->" in line
-                or line.isdigit()
-                or line.startswith(("NOTE", "STYLE", "Kind:", "Language:"))
-            ):
+        for block in re.split(r"\n\s*\n", vtt.replace("\r\n", "\n")):
+            block_lines = [line.strip() for line in block.split("\n")]
+            timing = [i for i, line in enumerate(block_lines) if "-->" in line]
+            if not timing:
                 continue
-            line = re.sub(r"<[^>]+>", "", line)
-            # consecutive cues often repeat the previous line
-            if not lines or lines[-1] != line:
-                lines.append(line)
+            for line in block_lines[timing[0] + 1 :]:
+                line = re.sub(r"<[^>]+>", "", line).strip()
+                # consecutive cues often repeat the previous line
+                if line and (not lines or lines[-1] != line):
+                    lines.append(line)
         return lines
 
     def download_transcript(self, output_dir, filename):
@@ -727,9 +754,17 @@ class EchoCloudVideo(EchoVideo):
 class EchoCloudSubVideo(EchoCloudVideo):
     """Some video in echo360 cloud is multi-part and this represents it."""
 
-    def __init__(self, video_json, driver, hostname, group_name, alternative_feeds):
+    def __init__(
+        self,
+        video_json,
+        driver,
+        hostname,
+        group_name,
+        alternative_feeds,
+        skip_video_discovery=False,
+    ):
         super(EchoCloudSubVideo, self).__init__(
-            video_json, driver, hostname, alternative_feeds
+            video_json, driver, hostname, alternative_feeds, skip_video_discovery
         )
         self.group_name = group_name
 
