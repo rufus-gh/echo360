@@ -163,6 +163,24 @@ def handle_args():
                 some 'echo360.org' hosts.",
     )
     parser.add_argument(
+        "--transcripts",
+        "-T",
+        action="store_true",
+        default=False,
+        dest="download_transcripts",
+        help="Also download each lecture's transcript (as .txt, plus .vtt captions \
+                when available) alongside the video. Only supported on echo360 cloud.",
+    )
+    parser.add_argument(
+        "--transcripts-only",
+        "-t",
+        action="store_true",
+        default=False,
+        dest="transcripts_only",
+        help="Download only the lecture transcripts (as .txt, plus .vtt captions \
+                when available) instead of the videos. Only supported on echo360 cloud.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=False,
@@ -253,6 +271,8 @@ def handle_args():
         args["alternative_feeds"],
         args["echo360cloud"],
         args["persistent_session"],
+        args["download_transcripts"],
+        args["transcripts_only"],
     )
 
 
@@ -274,6 +294,8 @@ def main():
         alternative_feeds,
         usingEcho360Cloud,
         persistent_session,
+        download_transcripts,
+        transcripts_only,
     ) = handle_args()
 
     setup_logging(enable_degbug)
@@ -372,6 +394,8 @@ def main():
         webdriver_to_use=webdriver_to_use,
         interactive_mode=interactive_mode,
         persistent_session=persistent_session,
+        download_transcripts=download_transcripts,
+        transcripts_only=transcripts_only,
     )
 
     _LOGGER.debug(

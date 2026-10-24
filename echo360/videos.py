@@ -113,6 +113,13 @@ class EchoVideo(object):
                     raise
                 stale_attempt += 1
 
+    def download_transcript(self, output_dir, filename):
+        print(
+            ">> Skipping transcript for '{}': transcripts are only supported "
+            "on the echo360 cloud platform.".format(filename)
+        )
+        return False
+
     @property
     def date(self):
         return self._date
@@ -546,6 +553,131 @@ class EchoCloudVideo(EchoVideo):
         # download both feeds.
         m3u8urls = list(reversed(m3u8urls))
         return m3u8urls[:2]
+
+    _MEDIA_ID_RE = re.compile(r'\\?"mediaId\\?"\s*:\s*\\?"([0-9a-fA-F-]{36})')
+    _CAPTIONS_VTT_RE = re.compile(r'https://captions\.[^"\'\s\\]+?\.vtt')
+
+    def _find_media_ids_and_captions(self, waitsecond=30):
+        # the classroom page embeds the player config (with the media id and
+        # the captions .vtt url) as escaped JSON, which can take a moment to
+        # appear after navigation.
+        import time
+
+        self._driver.get(self.video_url)
+        media_ids, captions = [], []
+        for _ in range(waitsecond):
+            page = self._driver.page_source.replace("\\/", "/")
+            media_ids = list(dict.fromkeys(self._MEDIA_ID_RE.findall(page)))
+            captions = list(dict.fromkeys(self._CAPTIONS_VTT_RE.findall(page)))
+            if media_ids:
+                break
+            time.sleep(1)
+        _LOGGER.debug("Media ids: %s, captions: %s", media_ids, captions)
+        return media_ids, captions
+
+    @staticmethod
+    def _transcript_json_to_lines(transcript_json):
+        # The transcript endpoint returns cues nested somewhere inside the
+        # response (e.g. data.contentJSON.cues); find the first list of cue-like
+        # dicts rather than hard-coding the exact path.
+        def find_cues(obj):
+            if isinstance(obj, list):
+                if obj and all(
+                    isinstance(c, dict) and ("content" in c or "text" in c)
+                    for c in obj
+                ):
+                    return obj
+                for item in obj:
+                    found = find_cues(item)
+                    if found:
+                        return found
+            elif isinstance(obj, dict):
+                for value in obj.values():
+                    found = find_cues(value)
+                    if found:
+                        return found
+            return None
+
+        cues = find_cues(transcript_json) or []
+        lines = []
+        for cue in cues:
+            text = cue.get("content", cue.get("text"))
+            if isinstance(text, str) and text.strip():
+                lines.append(text.strip())
+        return lines
+
+    @staticmethod
+    def _vtt_to_lines(vtt):
+        lines = []
+        for line in vtt.splitlines():
+            line = line.strip()
+            if (
+                not line
+                or line == "WEBVTT"
+                or "-->" in line
+                or line.isdigit()
+                or line.startswith(("NOTE", "STYLE", "Kind:", "Language:"))
+            ):
+                continue
+            line = re.sub(r"<[^>]+>", "", line)
+            # consecutive cues often repeat the previous line
+            if not lines or lines[-1] != line:
+                lines.append(line)
+        return lines
+
+    def download_transcript(self, output_dir, filename):
+        print('Downloading transcript "{}"'.format(filename))
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        txt_path = os.path.join(output_dir, filename + ".txt")
+        if os.path.exists(txt_path):
+            print(" > Skipping downloaded transcript")
+            return True
+
+        session = requests.Session()
+        for cookie in self._driver.get_cookies():
+            session.cookies.set(cookie["name"], cookie["value"])
+        session.headers["User-Agent"] = self._driver.execute_script(
+            "return navigator.userAgent"
+        )
+
+        media_ids, captions = self._find_media_ids_and_captions()
+
+        lines = []
+        for media_id in media_ids:
+            transcript_url = "{}/api/ui/echoplayer/lessons/{}/medias/{}/transcript".format(
+                self.hostname, self.video_id, media_id
+            )
+            r = session.get(transcript_url, headers={"Accept": "application/json"})
+            _LOGGER.debug("GET %s -> %s", transcript_url, r.status_code)
+            if r.ok:
+                try:
+                    lines = self._transcript_json_to_lines(r.json())
+                except ValueError:
+                    lines = []
+            if lines:
+                break
+
+        vtt = None
+        for caption_url in captions:
+            r = session.get(caption_url)
+            _LOGGER.debug("GET %s -> %s", caption_url, r.status_code)
+            if r.ok and r.text.lstrip().startswith("WEBVTT"):
+                vtt = r.text
+                break
+        if vtt is not None:
+            with open(os.path.join(output_dir, filename + ".vtt"), "w") as f:
+                f.write(vtt)
+            if not lines:
+                lines = self._vtt_to_lines(vtt)
+
+        if not lines:
+            print(" > No transcript found for this lecture.")
+            return False
+        with open(txt_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(" > Saved {} lines".format(len(lines)))
+        return True
 
     def _extract_date(self, video_json):
         if self.is_multipart_video:
