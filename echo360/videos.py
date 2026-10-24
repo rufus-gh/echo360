@@ -630,51 +630,79 @@ class EchoCloudVideo(EchoVideo):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         txt_path = os.path.join(output_dir, filename + ".txt")
-        if os.path.exists(txt_path):
+        vtt_path = os.path.join(output_dir, filename + ".vtt")
+        txt_exists = os.path.exists(txt_path)
+        if txt_exists and os.path.exists(vtt_path):
             print(" > Skipping downloaded transcript")
             return True
 
         session = requests.Session()
         for cookie in self._driver.get_cookies():
-            session.cookies.set(cookie["name"], cookie["value"])
+            # keep each cookie scoped to its own domain/path so it is only sent
+            # to the hosts the browser would send it to.
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain", ""),
+                path=cookie.get("path", "/"),
+            )
         session.headers["User-Agent"] = self._driver.execute_script(
             "return navigator.userAgent"
         )
+        timeout = (10, 60)  # (connect, read) seconds
 
         media_ids, captions = self._find_media_ids_and_captions()
 
         lines = []
-        for media_id in media_ids:
-            transcript_url = "{}/api/ui/echoplayer/lessons/{}/medias/{}/transcript".format(
-                self.hostname, self.video_id, media_id
-            )
-            r = session.get(transcript_url, headers={"Accept": "application/json"})
-            _LOGGER.debug("GET %s -> %s", transcript_url, r.status_code)
-            if r.ok:
+        if not txt_exists:
+            for media_id in media_ids:
+                transcript_url = (
+                    "{}/api/ui/echoplayer/lessons/{}/medias/{}/transcript".format(
+                        self.hostname, self.video_id, media_id
+                    )
+                )
                 try:
-                    lines = self._transcript_json_to_lines(r.json())
-                except ValueError:
-                    lines = []
-            if lines:
-                break
+                    r = session.get(
+                        transcript_url,
+                        headers={"Accept": "application/json"},
+                        timeout=timeout,
+                    )
+                except requests.exceptions.RequestException as e:
+                    _LOGGER.debug("GET %s failed: %s", transcript_url, e)
+                    continue
+                _LOGGER.debug("GET %s -> %s", transcript_url, r.status_code)
+                if r.ok:
+                    try:
+                        lines = self._transcript_json_to_lines(r.json())
+                    except ValueError:
+                        lines = []
+                if lines:
+                    break
 
         vtt = None
         for caption_url in captions:
-            r = session.get(caption_url)
+            try:
+                r = session.get(caption_url, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                _LOGGER.debug("GET %s failed: %s", caption_url, e)
+                continue
             _LOGGER.debug("GET %s -> %s", caption_url, r.status_code)
             if r.ok and r.text.lstrip().startswith("WEBVTT"):
                 vtt = r.text
                 break
         if vtt is not None:
-            with open(os.path.join(output_dir, filename + ".vtt"), "w") as f:
+            with open(vtt_path, "w", encoding="utf-8") as f:
                 f.write(vtt)
             if not lines:
                 lines = self._vtt_to_lines(vtt)
 
+        if txt_exists:
+            print(" > Skipping downloaded transcript")
+            return True
         if not lines:
             print(" > No transcript found for this lecture.")
             return False
-        with open(txt_path, "w") as f:
+        with open(txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         print(" > Saved {} lines".format(len(lines)))
         return True
